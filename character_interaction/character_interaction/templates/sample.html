@@ -1,0 +1,377 @@
+
+"<body>
+    <div id="container"></div>
+    <button onclick="sendMessage('Hello')">Send Hello</button>
+    <button onclick="startListening()">Start Listening</button>
+    <div id="status">Status: Idle</div>
+    <div id="ai-response">AI Response: </div>
+
+    <script>
+        let scene, camera, renderer, model, mixer, clock;
+        let audioContext, audioBuffer, audioStartTime;
+        const socket = new WebSocket('ws://' + window.location.host + '/ws/chat/');
+        const phonemeToShapeKey = {
+            // Define phoneme-to-shape-key mapping here
+            A: "viseme_PP",
+  B: "viseme_kk",
+  C: "viseme_I",
+  D: "viseme_AA",
+  E: "viseme_O",
+  F: "viseme_U",
+  G: "viseme_FF",
+  H: "viseme_TH",
+  X: "viseme_PP",
+        };
+
+        socket.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            if (data.audio && data.lipSyncData) {
+                playAudioWithLipSync(data.audio, data.lipSyncData);
+            }
+            if (data.text) {
+                document.getElementById('ai-response').textContent = AI Response: ${data.text};
+            }
+        };
+
+        function sendMessage(message) {
+            socket.send(JSON.stringify({ 'message': message }));
+        }
+
+        function startListening() {
+            const statusElement = document.getElementById('status');
+            statusElement.textContent = 'Status: Listening';
+
+            if (!('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
+                alert('Speech recognition not supported in this browser.');
+                statusElement.textContent = 'Status: Idle';
+                return;
+            }
+
+            const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+            recognition.interimResults = false;
+            recognition.maxAlternatives = 1;
+            recognition.lang = 'en-US';
+
+            recognition.start();
+
+            recognition.onresult = function(event) {
+                const transcript = event.results[0][0].transcript;
+                console.log('Transcript:', transcript);
+                sendMessage(transcript);
+                statusElement.textContent = Status: Transcription: ${transcript};
+            };
+
+            recognition.onerror = function(event) {
+                console.error('Speech recognition error:', event.error);
+                alert('Error: ' + event.error);
+                statusElement.textContent = 'Status: Idle';
+            };
+
+            recognition.onend = function() {
+                console.log('Speech recognition ended.');
+                statusElement.textContent = 'Status: Idle';
+            };
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('container').appendChild(renderer.domElement);
+            camera.position.set(0, 1.5, 1.5);
+
+            const light = new THREE.DirectionalLight(0xffffff, 1);
+            light.position.set(0, 1, 1).normalize();
+            scene.add(light);
+
+            const ambientLight = new THREE.AmbientLight(0x404040);
+            scene.add(ambientLight);
+
+            const loader = new THREE.GLTFLoader();
+            loader.load('{% static "66aa9e34cbd8dcebe57a7293.glb" %}', function(gltf) {
+                model = gltf.scene;
+                scene.add(model);
+
+                mixer = new THREE.AnimationMixer(model);
+                clock = new THREE.Clock();
+
+                animate();
+            }, undefined, function(error) {
+                console.error('An error happened while loading the model:', error);
+            });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (mixer) {
+                mixer.update(clock.getDelta());
+            }
+            renderer.render(scene, camera);
+        }
+
+        function setShapeKey(shapeKeyName) {
+            if (model) {
+                model.traverse(function (child) {
+                    if (child.isMesh && child.morphTargetDictionary) {
+                        const index = child.morphTargetDictionary[shapeKeyName];
+                        if (index !== undefined) {
+                            child.morphTargetInfluences[index] = 1;
+                            console.log(Setting shape key: ${shapeKeyName});
+                        }
+                    }
+                });
+            }
+        }
+
+        function applyLipSyncData(lipSyncData) {
+            if (!audioContext) {
+                console.error('Audio context is not initialized.');
+                return;
+            }
+
+            const phonemeQueue = lipSyncData.mouthCues;
+            if (!Array.isArray(phonemeQueue)) {
+                console.error('Invalid lip-sync data format:', lipSyncData);
+                return;
+            }
+
+            let phonemeIndex = 0;
+
+            function updatePhoneme() {
+                const currentTime = audioContext.currentTime;
+
+                while (phonemeIndex < phonemeQueue.length && phonemeQueue[phonemeIndex].start <= currentTime) {
+                    const phoneme = phonemeQueue[phonemeIndex];
+                    const shapeKey = phonemeToShapeKey[phoneme.value];
+
+                    if (shapeKey) {
+                        setShapeKey(shapeKey);
+                        setTimeout(() => setShapeKey('viseme_sil'), phoneme.end - phoneme.start); // Reset to silence after showing shape key
+                    } else {
+                        console.warn(Shape key not mapped for phoneme: ${phoneme.value});
+                    }
+
+                    phonemeIndex++;
+                }
+
+                if (phonemeIndex < phonemeQueue.length) {
+                    requestAnimationFrame(updatePhoneme);
+                }
+            }
+
+            updatePhoneme();
+        }
+
+        function playAudioWithLipSync(audioFile, lipSyncData) {
+            if (audioContext) {
+                audioContext.close();
+            }
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const url = /media/${audioFile.split('\\').pop()}; // Convert local path to URL
+
+            fetch(url)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Network response was not ok');
+                    }
+                    return response.arrayBuffer();
+                })
+                .then(data => audioContext.decodeAudioData(data))
+                .then(buffer => {
+                    audioBuffer = buffer;
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(audioContext.destination);
+                    source.start();
+                    audioStartTime = audioContext.currentTime;
+
+                    console.log('Audio started playing');
+                    applyLipSyncData(lipSyncData);
+                })
+                .catch(error => {
+                    console.error('Audio load error:', error);
+                });
+        }
+
+        window.onload = init;
+    </script>
+</body>"
+
+
+
+
+
+<!DOCTYPE html>
+{% load static %}
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GLB Model Viewer with Lip Sync</title>
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+        #controls { position: fixed; top: 10px; left: 10px; background: rgba(255, 255, 255, 0.8); padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <button onclick="startLipSync()">Start Lip Sync</button>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.143.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.143.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.143.0/examples/js/controls/OrbitControls.js"></script>
+    <script>
+        // Scene, camera, and renderer setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+        document.body.appendChild(renderer.domElement);
+
+        // Mouse controls for rotating the model
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.25;
+        controls.screenSpacePanning = false;
+        controls.minDistance = 1;
+        controls.maxDistance = 1000;
+        controls.maxPolarAngle = Math.PI / 2;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+        const pointLight = new THREE.PointLight(0xffffff, 1, 100);
+        pointLight.position.set(5, 5, 5);
+        scene.add(pointLight);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+        directionalLight.position.set(-5, 5, 5).normalize();
+        scene.add(directionalLight);
+
+        // Load the GLB model
+        let model;
+        const loader = new THREE.GLTFLoader();
+        loader.load("{% static '66aa9e34cbd8dcebe57a7293.glb' %}", function (gltf) {
+            model = gltf.scene;
+            scene.add(model);
+            model.scale.set(1, 1, 1);
+            model.position.set(0, 0, 0);
+            console.log('Model loaded successfully');
+        }, undefined, function (error) {
+            console.error('Error loading model:', error);
+        });
+
+        // Adjust camera position and view
+        camera.position.set(0, 1, 2);
+        camera.lookAt(0, 1, 0);
+
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Handle window resize
+        window.addEventListener('resize', function () {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+        });
+
+        // Shape key mapping
+        const shapeKeyMapping = {
+            'A': 'viseme_PP',
+            'B': 'viseme_kk',
+            'C': 'viseme_I',
+            'D': 'viseme_AA',
+            'E': 'viseme_O',
+            'F': 'viseme_U',
+            'G': 'viseme_FF',
+            'H': 'viseme_TH',
+            'X': 'viseme_PP'
+        };
+
+        // Initial setup
+        let audio = new Audio();
+        let mouthCues = [];
+        let syncInterval;
+
+        // Function to update shape keys based on the audio playback time
+        function updateShapeKeys() {
+            if (!model) return;
+            const currentTime = audio.currentTime;
+
+            model.traverse(function (object) {
+                if (object.isMesh && object.morphTargetDictionary && object.morphTargetInfluences) {
+                    object.morphTargetInfluences.fill(0);
+                    mouthCues.forEach(cue => {
+                        if (currentTime >= cue.start && currentTime <= cue.end) {
+                            const shapeKeyName = shapeKeyMapping[cue.value];
+                            if (shapeKeyName) {
+                                const morphTargetIndex = object.morphTargetDictionary[shapeKeyName];
+                                if (morphTargetIndex !== undefined) {
+                                    object.morphTargetInfluences[morphTargetIndex] = 1;
+                                } else {
+                                    console.warn(`Morph target ${shapeKeyName} not found`);
+                                }
+                            } else {
+                                console.warn(`Shape key mapping not found for value ${cue.value}`);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        // Function to start lip sync
+        function startLipSync() {
+            const socket = new WebSocket('ws://localhost:8000/ws/chat/');
+
+            socket.onopen = function () {
+                // Send your initial message to start the process
+                socket.send(JSON.stringify({ message: 'Your message here' }));
+            };
+
+            socket.onmessage = function (event) {
+                const data = JSON.parse(event.data);
+                const lipSyncDataUrl = data.lipSyncDataUrl;
+                audio.src = data.audio;
+
+                // Fetch lip sync data from the server
+                fetch(lipSyncDataUrl)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`Failed to fetch lip sync data: ${response.statusText}`);
+                        }
+                        return response.json();
+                    })
+                    .then(jsonData => {
+                        console.log(jsonData);
+                        mouthCues = jsonData.mouthCues;
+
+                        // Start playing the audio and handle lip sync cues
+                        audio.play();
+                        clearInterval(syncInterval); // Clear any existing intervals
+                        syncInterval = setInterval(updateShapeKeys, 100); // Update every 100ms
+                    })
+                    .catch(error => {
+                        console.error('Error fetching lip sync data:', error);
+                    });
+            };
+
+            socket.onclose = function () {
+                console.log('WebSocket connection closed');
+            };
+        }
+    </script>
+</body>
+</html>
